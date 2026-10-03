@@ -4,7 +4,7 @@
     "root": {
       "component_id": "root",
       "name": "Project Root",
-      "description": "Adopted codebase at /Users/jmcentire/Code/baton",
+      "description": "Adopted codebase at <workspace>/baton",
       "depth": 0,
       "parent_id": "",
       "children": [
