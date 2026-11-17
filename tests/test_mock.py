@@ -1390,3 +1390,73 @@ class TestSchemaComposition:
             status, body = await _exchange(port, "GET", "/invoices/123")
         assert status == 200
         assert body == {"invoice": "kept"}
+
+    async def test_ref_with_sibling_allof_satisfies_both(self, tmp_path: Path):
+        """A $ref and a sibling allOf both apply when the target is also an allOf.
+
+        Base requires a string id. The response schema refers to Base and adds
+        extra, which must be the constant "added". The body is loaded from a
+        spec file and served. Fails if either part is dropped, id is not a
+        string, or extra is not "added".
+        """
+        spec = _openapi(
+            {"/item": {"get": {"responses": _ok({
+                "$ref": "#/components/schemas/Base",
+                "allOf": [{
+                    "type": "object",
+                    "required": ["extra"],
+                    "properties": {"extra": {"const": "added"}},
+                }],
+            })}}},
+            schemas={
+                "Base": {
+                    "allOf": [{
+                        "type": "object",
+                        "required": ["id"],
+                        "properties": {"id": {"type": "string"}},
+                    }]
+                }
+            },
+        )
+        routes = load_routes(_write_spec(tmp_path, spec))
+        loaded = routes["/item"]["GET"]
+        self._assert_id_and_added(loaded)
+        async with _running(routes) as port:
+            status, served = await _exchange(port, "GET", "/item")
+        assert status == 200
+        assert served == loaded
+        self._assert_id_and_added(served)
+
+    @staticmethod
+    def _assert_id_and_added(body: object) -> None:
+        assert isinstance(body, dict)
+        assert isinstance(body.get("id"), str)
+        assert body.get("extra") == "added"
+
+    def test_allof_overlapping_enums_use_the_shared_value(self):
+        """allOf of two enums yields a value allowed by every part.
+
+        The only shared member is "allowed". Fails if the result is "wrong"
+        or any string outside both lists.
+        """
+        schema = {
+            "allOf": [
+                {"type": "string", "enum": ["allowed"]},
+                {"type": "string", "enum": ["wrong", "allowed"]},
+            ]
+        }
+        assert generate_instance(schema) == "allowed"
+
+    def test_allof_const_must_also_be_in_the_enum(self):
+        """allOf of a const and an enum equals the const when the enum allows it.
+
+        The enum lists "wrong" first, so taking that member fails. Fails if
+        the result is not "allowed".
+        """
+        schema = {
+            "allOf": [
+                {"type": "string", "enum": ["wrong", "allowed"]},
+                {"const": "allowed"},
+            ]
+        }
+        assert generate_instance(schema) == "allowed"
