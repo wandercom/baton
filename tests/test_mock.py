@@ -469,9 +469,10 @@ class TestMockServerTracing:
             await server.stop()
 
 
-# Acceptance coverage for path templates and schema composition.
-# Oracles are the lane brief and JSON Schema / OpenAPI semantics.
-# Authority is normative unless a docstring says the legacy suite is the source.
+# Path templates and schema composition for the mock server.
+# A matching request returns the body registered for the winning route.
+# A generated body is the value the schema itself requires: const, example,
+# default, an enum member, or the declared JSON type.
 
 
 def _free_port() -> int:
@@ -563,11 +564,11 @@ def _ok(schema: dict | None = None, example: object | None = None) -> dict:
 
 
 def _search_excerpt() -> dict:
-    """Minimal stand-in for the current search path and a pricing-shaped hit.
+    """Small search spec whose hit list refers to an object.
 
-    items is a schema ref to an object whose required rate_cents is an Int
-    ref. additionalProperties is an Int ref so a resolver that rejects that
-    keyword fails the load. The contract does not require an extra key.
+    That object's required rate_cents refers to an integer schema, and so do
+    any additional properties. A loader that rejects the keyword fails here.
+    The test does not require an extra property to be invented.
     """
     return _openapi(
         {
@@ -608,10 +609,10 @@ def _write_spec(tmp_path: Path, document: dict, name: str = "spec.json") -> str:
 
 
 def _load_bounded(spec_path: str, seconds: float = 5.0) -> dict:
-    """Run load_routes in a child so a recursive schema cannot hang this process.
+    """Load routes in a child process so a recursive schema cannot hang the test.
 
-    The 5 second ceiling is the test's reading of "bounded time": a tiny schema
-    that does not finish is not bounded. The contract states no byte limit.
+    A schema this small that does not finish within 5 seconds is treated as
+    unbounded.
     """
     script = (
         "import json, sys\n"
@@ -632,26 +633,6 @@ def _load_bounded(spec_path: str, seconds: float = 5.0) -> dict:
     return json.loads(completed.stdout)
 
 
-def _decode_chunked(body: bytes) -> bytes:
-    chunks = []
-    rest = body
-    while rest:
-        line, sep, rest = rest.partition(b"\r\n")
-        if not sep:
-            break
-        size_token = line.split(b";", 1)[0].strip()
-        if not size_token:
-            break
-        size = int(size_token, 16)
-        if size == 0:
-            break
-        chunks.append(rest[:size])
-        rest = rest[size:]
-        if rest.startswith(b"\r\n"):
-            rest = rest[2:]
-    return b"".join(chunks)
-
-
 def _parse_response(raw: bytes) -> tuple[int, bytes]:
     head, _, body = raw.partition(b"\r\n\r\n")
     lines = head.decode("iso-8859-1").split("\r\n")
@@ -662,9 +643,7 @@ def _parse_response(raw: bytes) -> tuple[int, bytes]:
             continue
         name, value = line.split(":", 1)
         headers[name.lower()] = value.strip().lower()
-    if headers.get("transfer-encoding") == "chunked":
-        body = _decode_chunked(body)
-    elif "content-length" in headers:
+    if "content-length" in headers:
         body = body[: int(headers["content-length"])]
     return status, body
 
@@ -707,14 +686,16 @@ async def _running(routes: dict):
 
 
 class TestPathTemplates:
-    """R1–R4. The registered body is the oracle: the request must return the
-    body of the route the brief says wins, or the stated 404 object.
+    """A `{name}` segment matches exactly one non-empty path segment.
+
+    The response is the body registered on the route that wins. A request
+    that matches no route returns 404 and names the path that was sent.
     """
 
     async def test_placeholder_matches_one_segment(self):
-        """R1. GET /invoices/123 and /invoices/456 both return the /invoices/{id} body.
+        """Both /invoices/123 and /invoices/456 return the /invoices/{id} body.
 
-        Falsifier: the template is ignored, or only a hard-coded id matches.
+        Fails if the placeholder is ignored, or if only one hard-coded id matches.
         """
         routes = {"/invoices/{id}": {"GET": {"resource": "invoice"}}}
         async with _running(routes) as port:
@@ -724,10 +705,10 @@ class TestPathTemplates:
                 assert body == {"resource": "invoice"}
 
     async def test_multiple_placeholders_each_match_one_segment(self):
-        """R1. Each {param} is one non-empty segment. A missing segment does not match.
+        """Each placeholder is one segment, and a missing last segment does not match.
 
-        Falsifier: one placeholder consumes several segments, or the last
-        placeholder is optional.
+        Fails if one placeholder swallows several segments, or if the last
+        placeholder is treated as optional.
         """
         routes = {"/orgs/{org}/invoices/{id}": {"GET": {"resource": "invoice"}}}
         async with _running(routes) as port:
@@ -739,9 +720,9 @@ class TestPathTemplates:
             assert body == {"error": "not found", "path": "/orgs/acme/invoices"}
 
     async def test_trailing_slash_still_matches_template(self):
-        """R1. A trailing slash is tolerated and does not become an extra segment.
+        """A trailing slash is still the same template match.
 
-        Falsifier: /invoices/123/ is rejected or routed as a different path.
+        Fails if /invoices/123/ is rejected or sent to a different route.
         """
         routes = {"/invoices/{id}": {"GET": {"resource": "invoice"}}}
         async with _running(routes) as port:
@@ -750,9 +731,9 @@ class TestPathTemplates:
             assert body == {"resource": "invoice"}
 
     async def test_query_string_ignored_for_template(self):
-        """R1. The query string is not part of template matching.
+        """A query string is ignored when matching a template.
 
-        Falsifier: /invoices/123?page=1 misses /invoices/{id}.
+        Fails if /invoices/123?page=1 does not hit /invoices/{id}.
         """
         routes = {"/invoices/{id}": {"GET": {"resource": "invoice"}}}
         async with _running(routes) as port:
@@ -761,14 +742,14 @@ class TestPathTemplates:
             assert body == {"resource": "invoice"}
 
     async def test_literal_path_beats_template(self):
-        """R2. /collections/wander/search wins over /collections/{collectionId}/search.
+        """The literal /collections/wander/search wins over the collection template.
 
-        The template is registered first, so first-match-wins fails this test.
-        A different collection id still uses the template. The wrong method
-        stays a 404 (R4).
+        The template is registered first, so a first-match implementation fails.
+        Another collection id still uses the template. GET on the literal path
+        is 404 because only POST is registered.
 
-        Falsifier: wander receives the template body, or every collection id
-        receives the literal body.
+        Fails if wander gets the template body, or if every collection id gets
+        the literal body.
         """
         routes = {
             "/collections/{collectionId}/search": {"POST": {"matched": "template"}},
@@ -786,13 +767,13 @@ class TestPathTemplates:
             assert body == {"error": "not found", "path": "/collections/wander/search"}
 
     async def test_more_specific_template_wins(self):
-        """R3. GET /a/1/b returns the body of /a/{x}/b, not /a/{x}/{y}.
+        """GET /a/1/b uses /a/{x}/b, the template with more literal segments.
 
-        The less specific template is registered first. /a/1/c does not fit
-        the literal segment, so it uses /a/{x}/{y}.
+        The less specific template is registered first. /a/1/c does not have
+        the literal segment b, so it uses /a/{x}/{y}.
 
-        Falsifier: the two templates are tied by length, or a non-matching
-        literal segment still captures the request.
+        Fails if the two templates are treated as equal, or if a literal
+        segment that does not match still captures the request.
         """
         routes = {
             "/a/{x}/{y}": {"GET": {"matched": "two-params"}},
@@ -817,14 +798,13 @@ class TestPathTemplates:
         ],
     )
     async def test_non_match_is_json_404(self, method: str, target: str):
-        """R4. Extra, missing, or empty segments, and the wrong method, are 404.
+        """An extra, missing, or empty segment, or the wrong method, is 404.
 
-        The body is exactly {"error": "not found", "path": <request path>}.
-        These targets have no trailing-slash ambiguity, so the request path
-        is the origin-form target.
+        The body is {"error": "not found", "path": <the path that was sent>}.
+        None of these targets ends with a slash, so the path is unambiguous.
 
-        Falsifier: a prefix match, an empty placeholder, or the wrong method
-        returns 200, or the 404 body omits the path that was requested.
+        Fails if a prefix, an empty placeholder, or the wrong method returns
+        200, or if the 404 body leaves out the requested path.
         """
         routes = {
             "/invoices/{id}": {"GET": {"resource": "invoice"}},
@@ -837,34 +817,35 @@ class TestPathTemplates:
 
 
 class TestSchemaComposition:
-    """R5–R11. Expected values are the schema's const, example, default, or
-    declared JSON type. Nothing here is recorded from a server run.
+    """Generated values come from the schema, not from a recorded response.
+
+    A const, example, or default is that value. An enum value is one of its
+    members. Otherwise the value has the declared JSON type. A `$ref` is
+    replaced by the schema it names before that rule is applied.
     """
 
     def test_wander_search_resolves_nested_refs(self, tmp_path: Path):
-        """R5. A wander search request hits the template and returns resolved refs.
+        """The search template's hit list resolves nested schema references.
 
-        Excerpt of the current search/pricing shape: POST
-        /collections/{collectionId}/search, items $ref to an object whose
-        required rate_cents is $ref Int. additionalProperties is also an Int
-        ref so a resolver that rejects that keyword fails this load. The
-        contract does not require a synthesized extra property.
+        POST /collections/{collectionId}/search returns hits, each an object
+        whose required rate_cents refers to an integer schema. additionalProperties
+        refers to that same integer, so a loader that rejects the keyword fails.
+        An extra property does not have to be invented. Arrays are still
+        non-empty, so an empty list cannot hide an unresolved item.
 
-        Falsifier: /collections/wander/search is 404, hits are missing, or
-        rate_cents is an object instead of an integer. Legacy array behavior
-        that still stands (R11) is a non-empty array, so an empty hits list
-        cannot hide an unresolved item ref.
+        Fails if the template key is missing, hits are missing, or rate_cents
+        is an object instead of an integer.
         """
         routes = load_routes(_write_spec(tmp_path, _search_excerpt()))
         body = routes["/collections/{collectionId}/search"]["POST"]
         self._assert_search_body(body)
 
     async def test_wander_search_serves_resolved_body(self, tmp_path: Path):
-        """R5 at the HTTP boundary. Same excerpt, served by MockServer.
+        """The same search body is what the server returns for a wander request.
 
-        The query string is the real search shape and must not affect matching.
-        Falsifier: the loaded body is right but the server 404s the template,
-        or the served rate_cents is not an integer.
+        The query string must not change which route matches. Fails if the
+        server answers 404 for the template, or if the served rate_cents is
+        not an integer.
         """
         routes = load_routes(_write_spec(tmp_path, _search_excerpt(), "search.json"))
         async with _running(routes) as port:
@@ -886,12 +867,11 @@ class TestSchemaComposition:
 
     @pytest.mark.parametrize("keyword", ["anyOf", "oneOf"])
     def test_ref_inside_union_prefers_value(self, tmp_path: Path, keyword: str):
-        """R5 and R8. A $ref inside anyOf/oneOf is resolved, and null loses.
+        """A schema reference inside anyOf or oneOf is used, and null loses.
 
-        Null is listed first. The other branch is const "Ada", so the body is
-        exactly that string. First-branch and unresolved-ref both fail.
-
-        Falsifier: the result is null, or an object standing in for the ref.
+        Null is listed first. The other branch is the const string "Ada", so
+        the body is exactly that string. Fails if the result is null, or if
+        the reference is left as an empty object.
         """
         spec = _openapi(
             {"/name": {"get": {"responses": _ok({
@@ -906,10 +886,10 @@ class TestSchemaComposition:
         assert routes["/name"]["GET"] == "Ada"
 
     def test_ref_inside_allof_merges_required_fields(self, tmp_path: Path):
-        """R5 and R9. allOf of two schema refs contains both required consts.
+        """allOf of two schema references keeps both required constants.
 
-        Falsifier: only the first branch is kept, or a ref is left unresolved
-        so id or rate_cents is missing or is an object.
+        Fails if only the first branch is kept, or if a reference is unresolved
+        and id or rate_cents is missing or is an object.
         """
         spec = _openapi(
             {"/price": {"get": {"responses": _ok({
@@ -938,13 +918,12 @@ class TestSchemaComposition:
         assert body.get("rate_cents") == 5
 
     def test_response_ref_returns_its_json_body(self, tmp_path: Path):
-        """R6 and R11. A response $ref returns that response's JSON example.
+        """A response that is only a $ref returns that response's JSON example.
 
-        The referenced response also has a schema that would generate a
-        different object. The media-type example still wins.
-
-        Falsifier: the response ref is dropped, or the schema is generated
-        instead of the example.
+        The referenced response also has a schema that would build a different
+        object. The example on the media type is the body instead. Fails if
+        the response reference is dropped, or if the schema is generated in
+        place of the example. parse_openapi and load_routes agree on that body.
         """
         spec = _openapi(
             {"/status": {"get": {"responses": {
@@ -972,10 +951,10 @@ class TestSchemaComposition:
         assert parse_openapi(path) == routes
 
     async def test_response_ref_is_served(self, tmp_path: Path):
-        """R6 at HTTP. The caller receives the referenced response body.
+        """The server returns the body of a response that was given by $ref.
 
-        Falsifier: load_routes followed the ref but the server returns a
-        different body, or 404s the literal path.
+        Fails if the loaded body followed the reference but the server returns
+        something else, or answers 404 for the literal path.
         """
         spec = _openapi(
             {"/status": {"get": {"responses": {
@@ -995,11 +974,11 @@ class TestSchemaComposition:
         assert body == {"status": "ok"}
 
     def test_self_reference_loads_finite_json(self, tmp_path: Path):
-        """R7. A schema that refers to itself loads as finite JSON.
+        """A schema that refers to itself still loads as finite JSON.
 
-        child is optional. value is a required integer, so an empty object
-        does not pass. Falsifier: load_routes raises, does not finish within
-        5 seconds, or returns a value json.dumps cannot encode.
+        child is optional. value is required and is an integer, so an empty
+        object does not pass. Fails if loading raises, does not finish within
+        5 seconds, or returns a value that is not finite JSON.
         """
         spec = _openapi(
             {"/node": {"get": {"responses": _ok(
@@ -1023,9 +1002,10 @@ class TestSchemaComposition:
         json.dumps(body)
 
     async def test_self_reference_http_body_is_finite(self, tmp_path: Path):
-        """R7 served. The HTTP body is the finite JSON load_routes produced.
+        """Serving that self-referencing schema returns the same finite JSON.
 
-        Falsifier: the server hangs or returns a body that is not that JSON.
+        Fails if the server hangs or returns a body other than the one that
+        was loaded.
         """
         spec = _openapi(
             {"/node": {"get": {"responses": _ok(
@@ -1051,10 +1031,10 @@ class TestSchemaComposition:
         json.dumps(body)
 
     def test_mutual_reference_loads_finite_json(self, tmp_path: Path):
-        """R7. Two schemas that refer to each other load in bounded time.
+        """Two schemas that refer to each other load as finite JSON.
 
-        Falsifier: the cycle raises, hangs past 5 seconds, or yields a value
-        that is not finite JSON. The required name stays a string.
+        Fails if the cycle raises, does not finish within 5 seconds, or yields
+        a value that is not finite JSON. The required name stays a string.
         """
         spec = _openapi(
             {"/a": {"get": {"responses": _ok(
@@ -1086,15 +1066,14 @@ class TestSchemaComposition:
         json.dumps(body)
 
     async def test_required_self_reference_stays_finite(self, tmp_path: Path):
-        """R7. A required self-reference is followed and still finishes.
+        """A required self-reference is followed, and loading still finishes.
 
-        Node.required includes child, so the generator cannot skip the cycle.
-        value stays an integer on the node that was asked for and on the
-        required child, which is that same schema. Nothing past the child
-        is inspected, so the depth at which expansion stops stays free.
+        child is required, so the cycle cannot be skipped. value is an integer
+        on the node and on that child. Nothing inside the child's own child
+        is checked, so where expansion stops is not fixed.
 
-        Falsifier: expansion does not finish within 5 seconds, raises, or
-        the followed node is an empty object instead of a Node.
+        Fails if loading or serving does not finish within 5 seconds, raises,
+        or leaves the child as an empty object.
         """
         spec = _openapi(
             {"/node": {"get": {"responses": _ok(
@@ -1117,15 +1096,16 @@ class TestSchemaComposition:
         )
 
     async def test_required_array_recursion_stays_finite(self, tmp_path: Path):
-        """R7. A required array of at least two self-refs stays finite.
+        """A required array of self-referencing items stays finite.
 
-        Tree.kids is required, minItems 2, and each item is a Tree. That
-        forces the cycle and rejects an expansion that branches without bound.
-        value stays an integer, and at least one kid is a Tree rather than
-        an empty object. Kid count and anything inside a kid's kids are free.
+        kids is required, asks for at least two items, and each item is the
+        same schema. That both follows the cycle and rejects an expansion
+        that branches without bound. value is an integer, and at least one
+        kid is a generated object with its own integer value. How many kids
+        appear, and what is inside a kid's own kids, is not checked.
 
-        Falsifier: load or serve does not finish within 5 seconds, raises,
-        or the array items were not generated as Trees.
+        Fails if loading or serving does not finish within 5 seconds, raises,
+        or the array items are empty objects.
         """
         spec = _openapi(
             {"/tree": {"get": {"responses": _ok(
@@ -1152,13 +1132,13 @@ class TestSchemaComposition:
         )
 
     async def test_required_mutual_recursion_stays_finite(self, tmp_path: Path):
-        """R7. Mutual recursion with both links required stays finite.
+        """Mutual recursion stays finite when both links are required.
 
-        A.b and B.a are required, so neither side can skip the other.
-        name stays a string on A and on the required B. B's link back to A
-        is not inspected.
+        A must include B, and B must include A, so neither side can skip the
+        other. name is a string on A and on that B. B's link back to A is
+        not inspected.
 
-        Falsifier: load or serve does not finish within 5 seconds, raises,
+        Fails if loading or serving does not finish within 5 seconds, raises,
         or the followed schema is an empty object.
         """
         spec = _openapi(
@@ -1206,13 +1186,11 @@ class TestSchemaComposition:
 
     @pytest.mark.parametrize("keyword", ["anyOf", "oneOf"])
     def test_union_prefers_non_null_branch(self, keyword: str):
-        """R8. "string or null" yields a string, even when null is listed first.
+        """anyOf and oneOf prefer a string over null when null is listed first.
 
-        The string branch is an enum, so a generator that ignores the union
-        and emits an arbitrary string still fails. Calling generate_instance
-        with only the schema must keep working.
-
-        Falsifier: the result is null, or a string outside the enum.
+        The string branch is an enum, so an arbitrary string still fails.
+        generate_instance is called with the schema alone. Fails if the result
+        is null, or a string other than "alpha" or "beta".
         """
         schema = {
             keyword: [
@@ -1224,10 +1202,10 @@ class TestSchemaComposition:
         assert generated == "alpha" or generated == "beta"
 
     def test_allof_contains_every_required_property(self):
-        """R9. The object contains the required properties of every allOf part.
+        """An allOf object contains the required properties of every part.
 
-        Falsifier: the second part's rate_cents is missing, or a part's
-        declared type is replaced with an object.
+        Fails if rate_cents from the second part is missing, or if a property
+        declared as a string or integer is generated as an object.
         """
         result = generate_instance({
             "allOf": [
@@ -1248,10 +1226,10 @@ class TestSchemaComposition:
         assert _is_json_int(result.get("rate_cents"))
 
     def test_const_is_the_generated_value(self, tmp_path: Path):
-        """R10. The generated value equals the const, including through a spec.
+        """A const schema generates that exact value, including from a spec file.
 
-        Falsifier: const is ignored and a value of that JSON type is invented,
-        or parse_openapi and load_routes disagree on the fixed body.
+        Fails if const is ignored and some other value of that JSON type is
+        invented, or if parse_openapi and load_routes disagree on the body.
         """
         assert generate_instance({"const": 7}) == 7
         assert generate_instance({"const": True}) is True
@@ -1266,14 +1244,14 @@ class TestSchemaComposition:
         assert parse_openapi(path) == routes
 
     def test_example_default_and_enum_survive_ref(self, tmp_path: Path):
-        """R11. Schema example, default, and enum still win after a $ref.
+        """example, default, and enum still apply after a schema reference.
 
-        Each keyword is on its own referenced schema, so they do not compete.
-        Enum asserts membership, not which member: the brief does not rank
-        members. Inline examples of these keywords already stand in the
-        legacy tests.
+        Each keyword sits on its own referenced schema, so they do not compete.
+        The enum value may be any member; which member is not specified.
+        The same keywords on an inline schema are already covered above.
 
-        Falsifier: resolving the ref drops the keyword and emits a free string.
+        Fails if following the reference drops the keyword and emits some
+        other string.
         """
         spec = _openapi(
             {"/label": {"get": {"responses": _ok({
@@ -1298,13 +1276,12 @@ class TestSchemaComposition:
         assert enum_value == "a" or enum_value == "b" or enum_value == "c"
 
     async def test_media_example_wins_on_template_path(self, tmp_path: Path):
-        """R11. A media-type example is the served body of a template route.
+        """A media-type example is the body served for a template route.
 
-        The schema would otherwise require a different const. The path key
-        stays written as /invoices/{id}.
-
-        Falsifier: template matching works but the example is discarded, or
-        the route key is rewritten without the placeholder.
+        The schema would otherwise require a different constant. The route
+        key stays written as /invoices/{id}. Fails if the placeholder route
+        matches but the example is discarded, or if the key is rewritten
+        without the placeholder.
         """
         spec = _openapi({
             "/invoices/{id}": {"get": {"responses": _ok(
