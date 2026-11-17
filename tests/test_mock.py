@@ -480,6 +480,49 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
+def _required_node_followed(body: object) -> bool:
+    """The node and its required child each carry an integer value.
+
+    The child's own child is the cut-off and is not examined.
+    """
+    if not isinstance(body, dict):
+        return False
+    child = body.get("child")
+    return (
+        _is_json_int(body.get("value"))
+        and isinstance(child, dict)
+        and _is_json_int(child.get("value"))
+    )
+
+
+def _required_tree_followed(body: object) -> bool:
+    """value is an integer and some kid was generated as a Tree.
+
+    How many kids, and what those kids contain, is the cut-off.
+    """
+    if not isinstance(body, dict) or not _is_json_int(body.get("value")):
+        return False
+    kids = body.get("kids")
+    if not isinstance(kids, list):
+        return False
+    return any(
+        isinstance(kid, dict) and _is_json_int(kid.get("value"))
+        for kid in kids
+    )
+
+
+def _required_mutual_followed(body: object) -> bool:
+    """A and the required B each have a string name. B's link back is free."""
+    if not isinstance(body, dict):
+        return False
+    other = body.get("b")
+    return (
+        isinstance(body.get("name"), str)
+        and isinstance(other, dict)
+        and isinstance(other.get("name"), str)
+    )
+
+
 def _is_json_int(value: object) -> bool:
     """JSON integers are not booleans. True is an int subclass in Python."""
     return isinstance(value, int) and not isinstance(value, bool)
@@ -1041,6 +1084,125 @@ class TestSchemaComposition:
         assert isinstance(body, dict)
         assert isinstance(body.get("name"), str)
         json.dumps(body)
+
+    async def test_required_self_reference_stays_finite(self, tmp_path: Path):
+        """R7. A required self-reference is followed and still finishes.
+
+        Node.required includes child, so the generator cannot skip the cycle.
+        value stays an integer on the node that was asked for and on the
+        required child, which is that same schema. Nothing past the child
+        is inspected, so the depth at which expansion stops stays free.
+
+        Falsifier: expansion does not finish within 5 seconds, raises, or
+        the followed node is an empty object instead of a Node.
+        """
+        spec = _openapi(
+            {"/node": {"get": {"responses": _ok(
+                {"$ref": "#/components/schemas/Node"}
+            )}}},
+            schemas={
+                "Node": {
+                    "type": "object",
+                    "required": ["value", "child"],
+                    "properties": {
+                        "value": {"type": "integer"},
+                        "child": {"$ref": "#/components/schemas/Node"},
+                    },
+                }
+            },
+        )
+        await self._assert_required_recursion(
+            tmp_path, spec, "required-self.json", "/node", "GET",
+            _required_node_followed,
+        )
+
+    async def test_required_array_recursion_stays_finite(self, tmp_path: Path):
+        """R7. A required array of at least two self-refs stays finite.
+
+        Tree.kids is required, minItems 2, and each item is a Tree. That
+        forces the cycle and rejects an expansion that branches without bound.
+        value stays an integer, and at least one kid is a Tree rather than
+        an empty object. Kid count and anything inside a kid's kids are free.
+
+        Falsifier: load or serve does not finish within 5 seconds, raises,
+        or the array items were not generated as Trees.
+        """
+        spec = _openapi(
+            {"/tree": {"get": {"responses": _ok(
+                {"$ref": "#/components/schemas/Tree"}
+            )}}},
+            schemas={
+                "Tree": {
+                    "type": "object",
+                    "required": ["value", "kids"],
+                    "properties": {
+                        "value": {"type": "integer"},
+                        "kids": {
+                            "type": "array",
+                            "minItems": 2,
+                            "items": {"$ref": "#/components/schemas/Tree"},
+                        },
+                    },
+                }
+            },
+        )
+        await self._assert_required_recursion(
+            tmp_path, spec, "required-tree.json", "/tree", "GET",
+            _required_tree_followed,
+        )
+
+    async def test_required_mutual_recursion_stays_finite(self, tmp_path: Path):
+        """R7. Mutual recursion with both links required stays finite.
+
+        A.b and B.a are required, so neither side can skip the other.
+        name stays a string on A and on the required B. B's link back to A
+        is not inspected.
+
+        Falsifier: load or serve does not finish within 5 seconds, raises,
+        or the followed schema is an empty object.
+        """
+        spec = _openapi(
+            {"/a": {"get": {"responses": _ok(
+                {"$ref": "#/components/schemas/A"}
+            )}}},
+            schemas={
+                "A": {
+                    "type": "object",
+                    "required": ["name", "b"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "b": {"$ref": "#/components/schemas/B"},
+                    },
+                },
+                "B": {
+                    "type": "object",
+                    "required": ["name", "a"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "a": {"$ref": "#/components/schemas/A"},
+                    },
+                },
+            },
+        )
+        await self._assert_required_recursion(
+            tmp_path, spec, "required-mutual.json", "/a", "GET",
+            _required_mutual_followed,
+        )
+
+    async def _assert_required_recursion(
+        self, tmp_path, spec, filename, path, method, field_ok,
+    ):
+        routes = _load_bounded(_write_spec(tmp_path, spec, filename))
+        loaded = routes[path][method]
+        json.dumps(loaded)
+        assert isinstance(loaded, dict)
+        assert field_ok(loaded), loaded
+        async with _running(routes) as port:
+            status, served = await _exchange(port, method, path)
+        assert status == 200
+        assert served == loaded
+        json.dumps(served)
+        assert field_ok(served), served
 
     @pytest.mark.parametrize("keyword", ["anyOf", "oneOf"])
     def test_union_prefers_non_null_branch(self, keyword: str):
