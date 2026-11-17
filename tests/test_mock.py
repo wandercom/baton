@@ -816,6 +816,94 @@ class TestPathTemplates:
             assert body == {"error": "not found", "path": target}
 
 
+class TestSpecTrailingSlash:
+    """A trailing slash is optional on the spec path and on the request.
+
+    `/x/{id}/` matches `/x/1` and `/x/1/`. `/foo/` matches `/foo` and `/foo/`.
+    When both `/foo` and `/foo/` are registered, a request that matches one
+    of them exactly gets that path's body. A matching path with no body for
+    the request method is 404 and names the path that was sent.
+    """
+
+    async def test_template_spec_slash_matches_with_or_without_slash(self):
+        """A template written with a trailing slash matches either request form.
+
+        `/x` and `/x/` do not match, because the placeholder is still required.
+        `/x/1/extra` does not match either. Fails if the slash on the spec
+        path makes `/x/1` miss, or if a missing or extra segment is accepted.
+        """
+        routes = {"/x/{id}/": {"GET": {"resource": "item"}}}
+        async with _running(routes) as port:
+            for target in ("/x/1", "/x/1/"):
+                status, body = await _exchange(port, "GET", target)
+                assert status == 200
+                assert body == {"resource": "item"}
+            for target in ("/x", "/x/", "/x/1/extra"):
+                status, body = await _exchange(port, "GET", target)
+                assert status == 404
+                assert body == {"error": "not found", "path": target}
+
+    async def test_literal_spec_slash_matches_with_or_without_slash(self):
+        """A literal path written with a trailing slash matches either request form.
+
+        `/foo/bar` is a different path. Fails if `/foo` misses `/foo/`, or if
+        a longer path is treated as the same route.
+        """
+        routes = {"/foo/": {"GET": {"resource": "foo"}}}
+        async with _running(routes) as port:
+            for target in ("/foo", "/foo/"):
+                status, body = await _exchange(port, "GET", target)
+                assert status == 200
+                assert body == {"resource": "foo"}
+            status, body = await _exchange(port, "GET", "/foo/bar")
+            assert status == 404
+            assert body == {"error": "not found", "path": "/foo/bar"}
+
+    async def test_exact_literal_wins_when_both_slash_forms_exist(self):
+        """Separate `/foo` and `/foo/` routes keep their own bodies.
+
+        The slash form is registered first. A request equal to one of the
+        two paths gets that path's body. Fails if the slash is stripped and
+        both requests receive the same body.
+        """
+        routes = {
+            "/foo/": {"GET": {"which": "slash"}},
+            "/foo": {"GET": {"which": "plain"}},
+        }
+        async with _running(routes) as port:
+            status, body = await _exchange(port, "GET", "/foo")
+            assert status == 200
+            assert body == {"which": "plain"}
+            status, body = await _exchange(port, "GET", "/foo/")
+            assert status == 200
+            assert body == {"which": "slash"}
+
+    async def test_wrong_method_on_slash_spec_is_404(self):
+        """A slash spec that has no body for the request method is 404.
+
+        GET still returns the registered body, so a matcher that rejects
+        every request does not pass. Fails if POST is served as GET, or if
+        the 404 body omits the path that was sent.
+        """
+        routes = {
+            "/foo/": {"GET": {"resource": "foo"}},
+            "/x/{id}/": {"GET": {"resource": "item"}},
+        }
+        async with _running(routes) as port:
+            status, body = await _exchange(port, "GET", "/foo")
+            assert status == 200
+            assert body == {"resource": "foo"}
+            for method, target in (
+                ("POST", "/foo"),
+                ("POST", "/foo/"),
+                ("POST", "/x/1"),
+                ("POST", "/x/1/"),
+            ):
+                status, body = await _exchange(port, method, target)
+                assert status == 404
+                assert body == {"error": "not found", "path": target}
+
+
 class TestSchemaComposition:
     """Generated values come from the schema, not from a recorded response.
 
