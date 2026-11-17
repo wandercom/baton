@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import string
 import time
 from pathlib import Path
@@ -24,16 +25,145 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def generate_instance(schema: dict) -> Any:
+def _resolve_ref(
+    value: dict, components: dict, seen: frozenset[str] = frozenset(),
+    diagnostics: set[str] | None = None,
+) -> dict:
+    """Follow local component references, including response aliases."""
+    if diagnostics is None:
+        diagnostics = set()
+    ref = value.get("$ref")
+    if not ref:
+        return value
+    if ref in seen:
+        return {}
+    target: Any = {"components": components}
+    if isinstance(ref, str) and ref.startswith("#/components/"):
+        for part in ref[2:].split("/"):
+            part = part.replace("~1", "/").replace("~0", "~")
+            target = target.get(part) if isinstance(target, dict) else None
+    else:
+        target = None
+    if not isinstance(target, dict):
+        if ref not in diagnostics:
+            logger.debug("Unresolved mock reference: %s", ref)
+            diagnostics.add(ref)
+        target = {}
+    resolved = _resolve_ref(target, components, seen | {ref}, diagnostics)
+    siblings = {key: val for key, val in value.items() if key != "$ref"}
+    return _merge_schema(resolved, siblings, diagnostics)
+
+
+def _merge_schema(left: dict, right: dict, diagnostics: set[str] | None = None) -> dict:
+    """Combine constraints for an allOf intersection."""
+    merged = {**left, **right}
+    if "allOf" in left and "allOf" in right:
+        merged["allOf"] = left["allOf"] + right["allOf"]
+    if ("enum" in left or "const" in left) and ("enum" in right or "const" in right):
+        left_values = [left["const"]] if "const" in left else left["enum"]
+        right_values = [right["const"]] if "const" in right else right["enum"]
+        values = [value for value in left_values if value in right_values]
+        if not values:
+            message = "Empty mock enum intersection; using a value from the first part"
+            if diagnostics is None or message not in diagnostics:
+                logger.debug(message)
+                if diagnostics is not None:
+                    diagnostics.add(message)
+            values = left_values or right_values or [None]
+        merged["enum"] = values
+        if "const" in merged:
+            merged["const"] = values[0]
+    if "properties" in left or "properties" in right:
+        props = dict(left.get("properties", {}))
+        for name, prop in right.get("properties", {}).items():
+            props[name] = {"allOf": [props[name], prop]} if name in props else prop
+        merged["properties"] = props
+    if "required" in left or "required" in right:
+        merged["required"] = list(
+            dict.fromkeys(left.get("required", []) + right.get("required", []))
+        )
+    for key in ("minimum", "minLength", "minItems", "minProperties"):
+        if key in left and key in right:
+            merged[key] = max(left[key], right[key])
+    for key in ("maximum", "maxLength", "maxItems", "maxProperties"):
+        if key in left and key in right:
+            merged[key] = min(left[key], right[key])
+    return merged
+
+
+def _expand_schema(
+    schema: dict, components: dict, depth: int = 0,
+    seen: frozenset[str] = frozenset(), diagnostics: set[str] | None = None,
+) -> dict:
+    ref = schema.get("$ref")
+    if depth >= 32 or ref in seen:
+        return {}
+    schema = _resolve_ref(schema, components, seen, diagnostics)
+    if ref:
+        seen = seen | {ref}
+    if "allOf" in schema:
+        merged = {}
+        for part in schema["allOf"]:
+            expanded = _expand_schema(part, components, depth + 1, seen, diagnostics)
+            merged = _merge_schema(merged, expanded, diagnostics)
+        schema = _merge_schema(
+            merged, {k: v for k, v in schema.items() if k != "allOf"}, diagnostics,
+        )
+    return schema
+
+
+def generate_instance(
+    schema: dict, components: dict | None = None, *,
+    _depth: int = 0, _seen: frozenset[str] = frozenset(),
+    _last_ref: str | None = None, _self_repeated: bool = False,
+    _diagnostics: set[str] | None = None,
+) -> Any:
     """Generate a random valid instance from a JSON Schema."""
-    if "example" in schema:
-        return schema["example"]
-    if "default" in schema:
-        return schema["default"]
-    if "enum" in schema:
-        return schema["enum"][0]
+    components = components or {}
+    if _diagnostics is None:
+        _diagnostics = set()
+    ref = schema.get("$ref")
+    repeated = ref in _seen
+    # Emit one full child for direct self-reference, then cut its next link.
+    # A link back through another schema remains a mutual-recursion cutoff.
+    if _depth >= 32 or (repeated and (ref != _last_ref or _self_repeated)):
+        return {}
+    schema = _expand_schema(
+        schema, components, seen=_seen - {ref} if repeated else _seen,
+        diagnostics=_diagnostics,
+    )
+    if ref:
+        _seen = _seen | {ref}
+        _last_ref = ref
+        _self_repeated = repeated
+    for key in ("example", "default", "enum", "const"):
+        if key in schema:
+            return schema[key][0] if key == "enum" else schema[key]
+
+    def generate(child: dict) -> Any:
+        return generate_instance(
+            child, components, _depth=_depth + 1, _seen=_seen,
+            _last_ref=_last_ref, _self_repeated=_self_repeated,
+            _diagnostics=_diagnostics,
+        )
+
+    for keyword in ("anyOf", "oneOf"):
+        if keyword in schema:
+            base = {k: v for k, v in schema.items() if k != keyword}
+            branches = [
+                _merge_schema(base, branch, _diagnostics) for branch in schema[keyword]
+            ]
+            # A reference may itself describe a null branch. Try all non-null
+            # results before accepting null, keeping declaration order otherwise.
+            for branch in branches:
+                value = generate(branch)
+                if value is not None:
+                    return value
+            return None
 
     schema_type = schema.get("type", "object")
+    if isinstance(schema_type, list):
+        schema_type = next((kind for kind in schema_type if kind != "null"), "null")
 
     if schema_type == "string":
         fmt = schema.get("format", "")
@@ -62,7 +192,7 @@ def generate_instance(schema: dict) -> Any:
     if schema_type == "array":
         items = schema.get("items", {"type": "string"})
         count = schema.get("minItems", 1)
-        return [generate_instance(items) for _ in range(count)]
+        return [generate(items) for _ in range(count)]
 
     if schema_type == "object":
         props = schema.get("properties", {})
@@ -70,7 +200,11 @@ def generate_instance(schema: dict) -> Any:
         obj = {}
         for name, prop_schema in props.items():
             if name in required:
-                obj[name] = generate_instance(prop_schema)
+                obj[name] = generate(prop_schema)
+        additional = schema.get("additionalProperties")
+        if not props and isinstance(additional, dict):
+            for index in range(schema.get("minProperties", 0)):
+                obj[f"key{index + 1}"] = generate(additional)
         return obj
 
     return None
@@ -91,7 +225,8 @@ def parse_openapi(spec_path: str) -> dict[str, dict[str, Any]]:
     if not spec or "paths" not in spec:
         return {}
 
-    components = spec.get("components", {}).get("schemas", {})
+    components = spec.get("components", {})
+    diagnostics: set[str] = set()
     routes: dict[str, dict[str, Any]] = {}
 
     for path_str, methods in spec["paths"].items():
@@ -104,14 +239,10 @@ def parse_openapi(spec_path: str) -> dict[str, dict[str, Any]]:
             # Find the success response
             responses = operation.get("responses", {})
             success_resp = responses.get("200") or responses.get("201") or {}
+            success_resp = _resolve_ref(success_resp, components, diagnostics=diagnostics)
             content = success_resp.get("content", {})
             json_content = content.get("application/json", {})
             resp_schema = json_content.get("schema", {})
-
-            # Resolve $ref
-            if "$ref" in resp_schema:
-                ref_name = resp_schema["$ref"].split("/")[-1]
-                resp_schema = components.get(ref_name, {})
 
             # Generate response body
             if "example" in json_content:
@@ -119,7 +250,7 @@ def parse_openapi(spec_path: str) -> dict[str, dict[str, Any]]:
             elif "example" in resp_schema:
                 body = resp_schema["example"]
             elif resp_schema:
-                body = generate_instance(resp_schema)
+                body = generate_instance(resp_schema, components, _diagnostics=diagnostics)
             else:
                 body = {}
 
@@ -174,6 +305,7 @@ class MockServer:
         node_name: str = "",
     ):
         self._route_tables: dict[int, dict[str, dict[str, Any]]] = {}
+        self._templates: dict[int, list[tuple[re.Pattern, dict[str, Any]]]] = {}
         self._servers: list[asyncio.Server] = []
         self._span_exporter = span_exporter
         self._node_name = node_name
@@ -182,13 +314,31 @@ class MockServer:
     def add_routes(self, port: int, routes: dict[str, dict[str, Any]]) -> None:
         """Register routes for a port."""
         self._route_tables[port] = routes
+        templates = []
+        for path, methods in routes.items():
+            segments = path.rstrip("/").split("/")
+            parameters = [
+                bool(re.fullmatch(r"\{[^{} /]+\}", segment)) for segment in segments
+            ]
+            if any(parameters):
+                pattern = "/".join(
+                    "[^/]+" if parameter else re.escape(segment)
+                    for segment, parameter in zip(segments, parameters)
+                )
+                specificity = sum(
+                    bool(segment) and not parameter
+                    for segment, parameter in zip(segments, parameters)
+                )
+                templates.append((specificity, re.compile(pattern), methods))
+        templates.sort(key=lambda entry: entry[0], reverse=True)
+        self._templates[port] = [(pattern, methods) for _, pattern, methods in templates]
 
     def add_default_routes(self, port: int) -> None:
         """Add a default health endpoint for a port with no contract."""
-        self._route_tables[port] = {
+        self.add_routes(port, {
             "/": {"GET": {"status": "mock", "port": port}},
             "/health": {"GET": {"status": "ok"}},
-        }
+        })
 
     async def start(self, host: str = "127.0.0.1") -> None:
         """Start HTTP servers for all registered ports."""
@@ -250,14 +400,20 @@ class MockServer:
                 path = path.split("?")[0]
 
             routes = self._route_tables.get(port, {})
-            route = routes.get(path, {})
+            alt_path = path.rstrip("/") if path != "/" else path
+            if path in routes:
+                route = routes[path]
+            elif alt_path in routes:
+                route = routes[alt_path]
+            elif path != "/" and alt_path + "/" in routes:
+                route = routes[alt_path + "/"]
+            else:
+                route = {}
+                for pattern, methods in self._templates.get(port, []):
+                    if pattern.fullmatch(path) or pattern.fullmatch(alt_path):
+                        route = methods
+                        break
             body = route.get(method)
-
-            if body is None:
-                # Try without trailing slash
-                alt_path = path.rstrip("/") if path != "/" else path
-                route = routes.get(alt_path, {})
-                body = route.get(method)
 
             status_code = 200
             if body is None:
