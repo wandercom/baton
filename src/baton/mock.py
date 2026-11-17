@@ -25,11 +25,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_unresolved_refs: set[str] = set()
-
-
-def _resolve_ref(value: dict, components: dict, seen: frozenset[str] = frozenset()) -> dict:
+def _resolve_ref(
+    value: dict, components: dict, seen: frozenset[str] = frozenset(),
+    unresolved: set[str] | None = None,
+) -> dict:
     """Follow local component references, including response aliases."""
+    if unresolved is None:
+        unresolved = set()
     ref = value.get("$ref")
     if not ref:
         return value
@@ -43,12 +45,13 @@ def _resolve_ref(value: dict, components: dict, seen: frozenset[str] = frozenset
     else:
         target = None
     if not isinstance(target, dict):
-        if ref not in _unresolved_refs:
+        if ref not in unresolved:
             logger.debug("Unresolved mock reference: %s", ref)
-            _unresolved_refs.add(ref)
+            unresolved.add(ref)
         target = {}
-    resolved = _resolve_ref(target, components, seen | {ref})
-    return {**resolved, **{key: val for key, val in value.items() if key != "$ref"}}
+    resolved = _resolve_ref(target, components, seen | {ref}, unresolved)
+    siblings = {key: val for key, val in value.items() if key != "$ref"}
+    return _merge_schema(resolved, siblings)
 
 
 def _merge_schema(left: dict, right: dict) -> dict:
@@ -74,18 +77,19 @@ def _merge_schema(left: dict, right: dict) -> dict:
 
 def _expand_schema(
     schema: dict, components: dict, depth: int = 0,
-    seen: frozenset[str] = frozenset(),
+    seen: frozenset[str] = frozenset(), unresolved: set[str] | None = None,
 ) -> dict:
     ref = schema.get("$ref")
     if depth >= 32 or ref in seen:
         return {}
-    schema = _resolve_ref(schema, components, seen)
+    schema = _resolve_ref(schema, components, seen, unresolved)
     if ref:
         seen = seen | {ref}
     if "allOf" in schema:
         merged = {}
         for part in schema["allOf"]:
-            merged = _merge_schema(merged, _expand_schema(part, components, depth + 1, seen))
+            expanded = _expand_schema(part, components, depth + 1, seen, unresolved)
+            merged = _merge_schema(merged, expanded)
         schema = _merge_schema(merged, {k: v for k, v in schema.items() if k != "allOf"})
     return schema
 
@@ -94,38 +98,35 @@ def generate_instance(
     schema: dict, components: dict | None = None, *,
     _depth: int = 0, _seen: frozenset[str] = frozenset(),
     _last_ref: str | None = None, _self_repeated: bool = False,
+    _unresolved: set[str] | None = None,
 ) -> Any:
     """Generate a random valid instance from a JSON Schema."""
     components = components or {}
+    if _unresolved is None:
+        _unresolved = set()
     ref = schema.get("$ref")
     repeated = ref in _seen
     # Emit one full child for direct self-reference, then cut its next link.
     # A link back through another schema remains a mutual-recursion cutoff.
     if _depth >= 32 or (repeated and (ref != _last_ref or _self_repeated)):
         return {}
-    # Preserve explicit values before following references or compositions.
-    for key in ("example", "default", "enum", "const"):
-        if key in schema:
-            return schema[key][0] if key == "enum" else schema[key]
-    schema = _expand_schema(schema, components, seen=_seen - {ref} if repeated else _seen)
+    schema = _expand_schema(
+        schema, components, seen=_seen - {ref} if repeated else _seen,
+        unresolved=_unresolved,
+    )
     if ref:
         _seen = _seen | {ref}
         _last_ref = ref
         _self_repeated = repeated
-    if "example" in schema:
-        return schema["example"]
-    if "default" in schema:
-        return schema["default"]
-    if "enum" in schema:
-        return schema["enum"][0]
-
-    if "const" in schema:
-        return schema["const"]
+    for key in ("example", "default", "enum", "const"):
+        if key in schema:
+            return schema[key][0] if key == "enum" else schema[key]
 
     def generate(child: dict) -> Any:
         return generate_instance(
             child, components, _depth=_depth + 1, _seen=_seen,
             _last_ref=_last_ref, _self_repeated=_self_repeated,
+            _unresolved=_unresolved,
         )
 
     for keyword in ("anyOf", "oneOf"):
@@ -182,7 +183,7 @@ def generate_instance(
                 obj[name] = generate(prop_schema)
         additional = schema.get("additionalProperties")
         if not props and isinstance(additional, dict):
-            for index in range(max(1, schema.get("minProperties", 0))):
+            for index in range(schema.get("minProperties", 0)):
                 obj[f"key{index + 1}"] = generate(additional)
         return obj
 
@@ -205,6 +206,7 @@ def parse_openapi(spec_path: str) -> dict[str, dict[str, Any]]:
         return {}
 
     components = spec.get("components", {})
+    unresolved: set[str] = set()
     routes: dict[str, dict[str, Any]] = {}
 
     for path_str, methods in spec["paths"].items():
@@ -217,7 +219,7 @@ def parse_openapi(spec_path: str) -> dict[str, dict[str, Any]]:
             # Find the success response
             responses = operation.get("responses", {})
             success_resp = responses.get("200") or responses.get("201") or {}
-            success_resp = _resolve_ref(success_resp, components)
+            success_resp = _resolve_ref(success_resp, components, unresolved=unresolved)
             content = success_resp.get("content", {})
             json_content = content.get("application/json", {})
             resp_schema = json_content.get("schema", {})
@@ -228,7 +230,7 @@ def parse_openapi(spec_path: str) -> dict[str, dict[str, Any]]:
             elif "example" in resp_schema:
                 body = resp_schema["example"]
             elif resp_schema:
-                body = generate_instance(resp_schema, components)
+                body = generate_instance(resp_schema, components, _unresolved=unresolved)
             else:
                 body = {}
 
