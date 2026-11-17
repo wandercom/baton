@@ -93,19 +93,25 @@ def _expand_schema(
 def generate_instance(
     schema: dict, components: dict | None = None, *,
     _depth: int = 0, _seen: frozenset[str] = frozenset(),
+    _last_ref: str | None = None, _self_repeated: bool = False,
 ) -> Any:
     """Generate a random valid instance from a JSON Schema."""
     components = components or {}
-    if _depth >= 32 or schema.get("$ref") in _seen:
+    ref = schema.get("$ref")
+    repeated = ref in _seen
+    # Emit one full child for direct self-reference, then cut its next link.
+    # A link back through another schema remains a mutual-recursion cutoff.
+    if _depth >= 32 or (repeated and (ref != _last_ref or _self_repeated)):
         return {}
     # Preserve explicit values before following references or compositions.
     for key in ("example", "default", "enum", "const"):
         if key in schema:
             return schema[key][0] if key == "enum" else schema[key]
-    ref = schema.get("$ref")
-    schema = _expand_schema(schema, components, seen=_seen)
+    schema = _expand_schema(schema, components, seen=_seen - {ref} if repeated else _seen)
     if ref:
         _seen = _seen | {ref}
+        _last_ref = ref
+        _self_repeated = repeated
     if "example" in schema:
         return schema["example"]
     if "default" in schema:
@@ -117,7 +123,10 @@ def generate_instance(
         return schema["const"]
 
     def generate(child: dict) -> Any:
-        return generate_instance(child, components, _depth=_depth + 1, _seen=_seen)
+        return generate_instance(
+            child, components, _depth=_depth + 1, _seen=_seen,
+            _last_ref=_last_ref, _self_repeated=_self_repeated,
+        )
 
     for keyword in ("anyOf", "oneOf"):
         if keyword in schema:
