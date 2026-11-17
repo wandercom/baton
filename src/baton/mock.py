@@ -27,11 +27,11 @@ logger = logging.getLogger(__name__)
 
 def _resolve_ref(
     value: dict, components: dict, seen: frozenset[str] = frozenset(),
-    unresolved: set[str] | None = None,
+    diagnostics: set[str] | None = None,
 ) -> dict:
     """Follow local component references, including response aliases."""
-    if unresolved is None:
-        unresolved = set()
+    if diagnostics is None:
+        diagnostics = set()
     ref = value.get("$ref")
     if not ref:
         return value
@@ -45,18 +45,34 @@ def _resolve_ref(
     else:
         target = None
     if not isinstance(target, dict):
-        if ref not in unresolved:
+        if ref not in diagnostics:
             logger.debug("Unresolved mock reference: %s", ref)
-            unresolved.add(ref)
+            diagnostics.add(ref)
         target = {}
-    resolved = _resolve_ref(target, components, seen | {ref}, unresolved)
+    resolved = _resolve_ref(target, components, seen | {ref}, diagnostics)
     siblings = {key: val for key, val in value.items() if key != "$ref"}
-    return _merge_schema(resolved, siblings)
+    return _merge_schema(resolved, siblings, diagnostics)
 
 
-def _merge_schema(left: dict, right: dict) -> dict:
-    """Combine object properties and requirements for an allOf intersection."""
+def _merge_schema(left: dict, right: dict, diagnostics: set[str] | None = None) -> dict:
+    """Combine constraints for an allOf intersection."""
     merged = {**left, **right}
+    if "allOf" in left and "allOf" in right:
+        merged["allOf"] = left["allOf"] + right["allOf"]
+    if ("enum" in left or "const" in left) and ("enum" in right or "const" in right):
+        left_values = [left["const"]] if "const" in left else left["enum"]
+        right_values = [right["const"]] if "const" in right else right["enum"]
+        values = [value for value in left_values if value in right_values]
+        if not values:
+            message = "Empty mock enum intersection; using a value from the first part"
+            if diagnostics is None or message not in diagnostics:
+                logger.debug(message)
+                if diagnostics is not None:
+                    diagnostics.add(message)
+            values = left_values or right_values or [None]
+        merged["enum"] = values
+        if "const" in merged:
+            merged["const"] = values[0]
     if "properties" in left or "properties" in right:
         props = dict(left.get("properties", {}))
         for name, prop in right.get("properties", {}).items():
@@ -77,20 +93,22 @@ def _merge_schema(left: dict, right: dict) -> dict:
 
 def _expand_schema(
     schema: dict, components: dict, depth: int = 0,
-    seen: frozenset[str] = frozenset(), unresolved: set[str] | None = None,
+    seen: frozenset[str] = frozenset(), diagnostics: set[str] | None = None,
 ) -> dict:
     ref = schema.get("$ref")
     if depth >= 32 or ref in seen:
         return {}
-    schema = _resolve_ref(schema, components, seen, unresolved)
+    schema = _resolve_ref(schema, components, seen, diagnostics)
     if ref:
         seen = seen | {ref}
     if "allOf" in schema:
         merged = {}
         for part in schema["allOf"]:
-            expanded = _expand_schema(part, components, depth + 1, seen, unresolved)
-            merged = _merge_schema(merged, expanded)
-        schema = _merge_schema(merged, {k: v for k, v in schema.items() if k != "allOf"})
+            expanded = _expand_schema(part, components, depth + 1, seen, diagnostics)
+            merged = _merge_schema(merged, expanded, diagnostics)
+        schema = _merge_schema(
+            merged, {k: v for k, v in schema.items() if k != "allOf"}, diagnostics,
+        )
     return schema
 
 
@@ -98,12 +116,12 @@ def generate_instance(
     schema: dict, components: dict | None = None, *,
     _depth: int = 0, _seen: frozenset[str] = frozenset(),
     _last_ref: str | None = None, _self_repeated: bool = False,
-    _unresolved: set[str] | None = None,
+    _diagnostics: set[str] | None = None,
 ) -> Any:
     """Generate a random valid instance from a JSON Schema."""
     components = components or {}
-    if _unresolved is None:
-        _unresolved = set()
+    if _diagnostics is None:
+        _diagnostics = set()
     ref = schema.get("$ref")
     repeated = ref in _seen
     # Emit one full child for direct self-reference, then cut its next link.
@@ -112,7 +130,7 @@ def generate_instance(
         return {}
     schema = _expand_schema(
         schema, components, seen=_seen - {ref} if repeated else _seen,
-        unresolved=_unresolved,
+        diagnostics=_diagnostics,
     )
     if ref:
         _seen = _seen | {ref}
@@ -126,13 +144,15 @@ def generate_instance(
         return generate_instance(
             child, components, _depth=_depth + 1, _seen=_seen,
             _last_ref=_last_ref, _self_repeated=_self_repeated,
-            _unresolved=_unresolved,
+            _diagnostics=_diagnostics,
         )
 
     for keyword in ("anyOf", "oneOf"):
         if keyword in schema:
             base = {k: v for k, v in schema.items() if k != keyword}
-            branches = [_merge_schema(base, branch) for branch in schema[keyword]]
+            branches = [
+                _merge_schema(base, branch, _diagnostics) for branch in schema[keyword]
+            ]
             # A reference may itself describe a null branch. Try all non-null
             # results before accepting null, keeping declaration order otherwise.
             for branch in branches:
@@ -206,7 +226,7 @@ def parse_openapi(spec_path: str) -> dict[str, dict[str, Any]]:
         return {}
 
     components = spec.get("components", {})
-    unresolved: set[str] = set()
+    diagnostics: set[str] = set()
     routes: dict[str, dict[str, Any]] = {}
 
     for path_str, methods in spec["paths"].items():
@@ -219,7 +239,7 @@ def parse_openapi(spec_path: str) -> dict[str, dict[str, Any]]:
             # Find the success response
             responses = operation.get("responses", {})
             success_resp = responses.get("200") or responses.get("201") or {}
-            success_resp = _resolve_ref(success_resp, components, unresolved=unresolved)
+            success_resp = _resolve_ref(success_resp, components, diagnostics=diagnostics)
             content = success_resp.get("content", {})
             json_content = content.get("application/json", {})
             resp_schema = json_content.get("schema", {})
@@ -230,7 +250,7 @@ def parse_openapi(spec_path: str) -> dict[str, dict[str, Any]]:
             elif "example" in resp_schema:
                 body = resp_schema["example"]
             elif resp_schema:
-                body = generate_instance(resp_schema, components, _unresolved=unresolved)
+                body = generate_instance(resp_schema, components, _diagnostics=diagnostics)
             else:
                 body = {}
 
