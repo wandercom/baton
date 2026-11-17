@@ -296,7 +296,7 @@ class MockServer:
         self._route_tables[port] = routes
         templates = []
         for path, methods in routes.items():
-            segments = path.split("/")
+            segments = path.rstrip("/").split("/")
             parameters = [
                 bool(re.fullmatch(r"\{[^{} /]+\}", segment)) for segment in segments
             ]
@@ -385,6 +385,8 @@ class MockServer:
                 route = routes[path]
             elif alt_path in routes:
                 route = routes[alt_path]
+            elif path != "/" and alt_path + "/" in routes:
+                route = routes[alt_path + "/"]
             else:
                 route = {}
                 for pattern, methods in self._templates.get(port, []):
